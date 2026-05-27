@@ -2,7 +2,7 @@ MIMIC-IV External Validation
 
 This folder contains the scripts used for external validation of the AECOPD-CV prediction model in the MIMIC-IV database.
 
-The external validation framework was implemented using a frozen-model approach. Original regression coefficients and predefined median-imputation values derived from the development cohort were applied directly to the MIMIC-IV dataset without model refitting, recalibration, or coefficient updating.
+The external validation framework was implemented using a frozen-model approach. Original regression coefficients and predefined median-imputation values derived from the development cohort were applied directly to the MIMIC-IV dataset without model refitting, recalibration, or coefficient updating. Predicted_probability_frozen was generated using the original model coefficients, frozen development-cohort median imputation values, and prespecified internal calibration intercept/slope parameters derived before external validation. No external validation outcomes were used to estimate prediction parameters.
 
 External validation analyses were performed using multiple laboratory extraction strategies to evaluate robustness under varying conditions of laboratory availability:
 - 6-hour laboratory window
