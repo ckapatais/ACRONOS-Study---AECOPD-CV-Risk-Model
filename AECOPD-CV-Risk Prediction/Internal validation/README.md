@@ -1,3 +1,4 @@
+INTERNAL VALIDATION SCRIPT:
 Section 1. Overview:
 
 This repository contains the final internal-validation workflow for the AECOPD-CV prediction model developed to estimate the risk of acute cardiovascular complications among ICU patients admitted with acute exacerbation of chronic obstructive pulmonary disease (AECOPD).
@@ -104,3 +105,13 @@ The repository contains the exact code used for:
 3. Export of patient-level predictions and performance metrics.
 
 No manual post-processing steps were applied after script execution.
+
+IMPUTATION SENSITIVITY ANALYSIS:
+This script evaluates whether the performance of the AECOPD-CV model is robust to alternative strategies for handling missing predictor values. It applies the same predictor set and composite cardiovascular outcome definition across all analyses, while varying only the imputation method. The evaluated approaches include median imputation, mean imputation, K-nearest-neighbour imputation, iterative imputation, and complete-case analysis. For each strategy, the script fits the model, generates predicted probabilities, and automatically exports discrimination, calibration, Brier score, decision curve analysis, and risk-stratification outputs.
+
+Input: The script expects the original development dataset as an Excel file containing the model predictors and cardiovascular outcome components.
+
+Example command: python imputation_sensitivity_github_final.py --input "C:\path\to\Anonymized data.xlsx" --output "C:\path\to\imputation_sensitivity_outputs"
+
+Main outputs:
+The script generates summary tables and figures comparing model performance across imputation strategies, including ROC curves, calibration plots, decision curve analysis, Brier scores, and patient-level prediction outputs.
