@@ -26,11 +26,11 @@ BUN_MIN, BUN_MAX = 1.0, 300.0
 LACTATE_MIN, LACTATE_MAX = 0.1, 30.0
 BUN_TO_UREA_FACTOR = 2.14
 
-ORIGINAL_VALIDATION = Path(r"C:\Users\User\Desktop\Papaioannou\Idea 1\mimic-iv-3.1\Database.xlsx")
+ORIGINAL_VALIDATION = Path(r"[Your directory]\Database.xlsx")
 ORIGINAL_SHEET = "AECOPD_validation_dataset_v3"
-MIMIC_ROOT = Path(r"C:\Users\User\Desktop\Papaioannou\Idea 1\mimic-iv-3.1")
-INTERNAL_MODEL_DIR = Path(r"C:\Users\User\Desktop\Papaioannou\Idea 1\FINAL MODEL\1. AECOPD_CV_FINAL_MODEL_Internal Validation")
-OUTPUT_DIR = Path(r"C:\Users\User\Desktop\Papaioannou\Idea 1\external_validation_6h_original")
+MIMIC_ROOT = Path(r"[Your directory]\mimic-iv-3.1")
+INTERNAL_MODEL_DIR = Path(r"[Your directory]\AECOPD_CV_FINAL_MODEL_Internal Validation")
+OUTPUT_DIR = Path(r"[Your directory]\external_validation_6h_original")
 LAB_WINDOW_HOURS = 6
 MEDIANS_CSV = None
 
@@ -103,6 +103,7 @@ def apply_final_cv_outcome_definition(df: pd.DataFrame) -> pd.DataFrame:
     required = [
         "mi_inclusive_event",
         "arrhythmia_inclusive_event",
+        "pulmonary_edema_event",
         "hf_decompensation_event",
         "pe_inclusive_event",
     ]
@@ -113,6 +114,7 @@ def apply_final_cv_outcome_definition(df: pd.DataFrame) -> pd.DataFrame:
     out["cv_event_database_original"] = as_event_flag(out["cv_event"]) if "cv_event" in out.columns else 0
     out["mi_inclusive_event"] = as_event_flag(out["mi_inclusive_event"])
     out["arrhythmia_inclusive_event"] = as_event_flag(out["arrhythmia_inclusive_event"])
+    out["pulmonary_edema_event"] = as_event_flag(out["pulmonary_edema_event"])
     out["hf_decompensation_event"] = as_event_flag(out["hf_decompensation_event"])
     out["pe_inclusive_event"] = as_event_flag(out["pe_inclusive_event"])
 
