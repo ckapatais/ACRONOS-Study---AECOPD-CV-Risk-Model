@@ -122,6 +122,7 @@ def apply_final_cv_outcome_definition(df: pd.DataFrame) -> pd.DataFrame:
         (out["mi_inclusive_event"] == 1)
         | (out["arrhythmia_inclusive_event"] == 1)
         | (out["hf_decompensation_event"] == 1)
+        | (out["pulmonary_edema_event"] == 1)
         | (out["pe_inclusive_event"] == 1)
     ).astype(int)
 
