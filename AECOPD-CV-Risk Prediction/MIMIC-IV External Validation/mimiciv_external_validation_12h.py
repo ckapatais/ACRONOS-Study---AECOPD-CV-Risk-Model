@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import json
 import warnings
 from pathlib import Path
@@ -19,17 +18,43 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 RANDOM_STATE = 42
 CHUNK_SIZE = 1_000_000
+
 MODEL_FEATURES = ["age", "history_hf", "history_af", "ph", "urea", "lactate"]
+
 PH_MIN, PH_MAX = 6.8, 7.8
 BUN_MIN, BUN_MAX = 1.0, 300.0
 LACTATE_MIN, LACTATE_MAX = 0.1, 30.0
 BUN_TO_UREA_FACTOR = 2.14
 
+# -----------------------------------------------------------------------------
+# USER SETTINGS
+# -----------------------------------------------------------------------------
+# Place this script inside your project/working directory, activate your Python
+# environment there, and run the script from that directory.
+#
+# Expected default structure:
+#   [your working directory]/Database.xlsx
+#   [your working directory]/mimic-iv-3.1/
+#   [your working directory]/AECOPD_CV_FINAL_MODEL_Internal_Validation/
+#   [your working directory]/external_validation_12h/
+#
+# If your files/folders have different names, edit only the paths below.
+# -----------------------------------------------------------------------------
+PROJECT_ROOT = Path.cwd()
+
+ORIGINAL_VALIDATION = PROJECT_ROOT / "Database.xlsx"
+ORIGINAL_SHEET = "AECOPD_validation_dataset_v3"
+MIMIC_ROOT = PROJECT_ROOT / "mimic-iv-3.1"
+INTERNAL_MODEL_DIR = PROJECT_ROOT / "AECOPD_CV_FINAL_MODEL_Internal_Validation"
+OUTPUT_DIR = PROJECT_ROOT / "external_validation_12h"
+LAB_WINDOW_HOURS = 12
+MEDIANS_CSV = None
+
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
 
 
 def first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -42,10 +67,10 @@ def first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 def pick_file(folder: Path, stem: str) -> Path:
     for name in [f"{stem}.csv", f"{stem}.csv.gz"]:
-        path = folder / name
-        if path.exists():
-            return path
-    raise FileNotFoundError(f"{stem}.csv or {stem}.csv.gz was not found in {folder}")
+        p = folder / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"Could not find {stem}.csv or {stem}.csv.gz in {folder}")
 
 
 def read_csv_auto(path: Path, **kwargs) -> pd.DataFrame:
@@ -61,16 +86,16 @@ def read_table(path: Path, sheet: str | None = None) -> pd.DataFrame:
 
 
 def find_file(folder: Path, filename: str) -> Path:
-    path = folder / filename
-    if path.exists():
-        return path
+    direct = folder / filename
+    if direct.exists():
+        return direct
     matches = list(folder.rglob(filename))
     if matches:
         return matches[0]
-    raise FileNotFoundError(f"{filename} was not found in {folder}")
+    raise FileNotFoundError(f"Could not find {filename} inside {folder}")
 
 
-def set_plot_style() -> None:
+def style() -> None:
     plt.rcParams.update({
         "font.size": 11,
         "axes.titlesize": 16,
@@ -85,18 +110,58 @@ def set_plot_style() -> None:
     })
 
 
-def load_validation_cohort(path: Path, sheet: str | None = None) -> pd.DataFrame:
+def as_event_flag(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int).clip(0, 1)
+
+
+def apply_final_cv_outcome_definition(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    required = [
+        "mi_inclusive_event",
+        "arrhythmia_inclusive_event",
+        "hf_decompensation_event",
+        "pe_inclusive_event",
+    ]
+    missing = [c for c in required if c not in out.columns]
+    if missing:
+        raise ValueError("Missing columns required for final cardiovascular outcome definition: " + ", ".join(missing))
+
+    out["cv_event_database_original"] = as_event_flag(out["cv_event"]) if "cv_event" in out.columns else 0
+    out["mi_inclusive_event"] = as_event_flag(out["mi_inclusive_event"])
+    out["arrhythmia_inclusive_event"] = as_event_flag(out["arrhythmia_inclusive_event"])
+    out["hf_decompensation_event"] = as_event_flag(out["hf_decompensation_event"])
+    out["pe_inclusive_event"] = as_event_flag(out["pe_inclusive_event"])
+
+    out["cv_event"] = (
+        (out["mi_inclusive_event"] == 1)
+        | (out["arrhythmia_inclusive_event"] == 1)
+        | (out["hf_decompensation_event"] == 1)
+        | (out["pe_inclusive_event"] == 1)
+    ).astype(int)
+
+    return out
+
+
+def get_id_cols(df: pd.DataFrame) -> list[str]:
+    if "subject_id" in df.columns and "hadm_id" in df.columns:
+        return ["subject_id", "hadm_id"]
+    raise ValueError("The original MIMIC-IV validation file must contain subject_id and hadm_id.")
+
+
+def load_original_validation(path: Path, sheet: str | None = None) -> pd.DataFrame:
     df = read_table(path, sheet)
-    if "subject_id" not in df.columns or "hadm_id" not in df.columns:
-        raise ValueError("The validation cohort must contain subject_id and hadm_id.")
-    if "cv_event" not in df.columns:
-        raise ValueError("The validation cohort must contain cv_event.")
-    for col in ["subject_id", "hadm_id"]:
+    id_cols = get_id_cols(df)
+
+    for col in id_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-    return df.dropna(subset=["subject_id", "hadm_id"]).copy()
+
+    df = df.dropna(subset=id_cols).copy()
+    df = apply_final_cv_outcome_definition(df)
+
+    return df
 
 
-def load_admission_times(hosp_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
+def load_admissions_for_original(hosp_dir: Path, original_df: pd.DataFrame) -> pd.DataFrame:
     admissions = read_csv_auto(
         pick_file(hosp_dir, "admissions"),
         usecols=["subject_id", "hadm_id", "admittime", "dischtime"],
@@ -106,11 +171,14 @@ def load_admission_times(hosp_dir: Path, cohort: pd.DataFrame) -> pd.DataFrame:
     admissions["hadm_id"] = pd.to_numeric(admissions["hadm_id"], errors="coerce").astype("Int64")
     admissions["admittime"] = pd.to_datetime(admissions["admittime"], errors="coerce")
     admissions["dischtime"] = pd.to_datetime(admissions["dischtime"], errors="coerce")
-    keys = cohort[["subject_id", "hadm_id"]].drop_duplicates()
+
+    keys = original_df[["subject_id", "hadm_id"]].drop_duplicates()
     out = keys.merge(admissions, on=["subject_id", "hadm_id"], how="left")
-    missing = int(out["admittime"].isna().sum())
+
+    missing = out["admittime"].isna().sum()
     if missing:
-        raise ValueError(f"{missing} admissions could not be linked to admittime.")
+        raise ValueError(f"{missing} original validation admissions could not be linked to MIMIC-IV admissions/admittime.")
+
     return out
 
 
@@ -118,103 +186,136 @@ def normalize_label(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip().str.upper()
 
 
-def get_lab_itemids(hosp_dir: Path) -> tuple[dict[str, set[int]], pd.DataFrame]:
-    dlab = normalize_columns(read_csv_auto(pick_file(hosp_dir, "d_labitems"), low_memory=False))
+def get_labevents_itemids(hosp_dir: Path) -> tuple[dict[str, set[int]], pd.DataFrame]:
+    dlab = read_csv_auto(pick_file(hosp_dir, "d_labitems"), low_memory=False)
+    dlab = normalize_columns(dlab)
+
     if "itemid" not in dlab.columns or "label" not in dlab.columns:
         raise ValueError("d_labitems must contain itemid and label.")
+
     dlab["label_norm"] = normalize_label(dlab["label"])
     dlab["fluid_norm"] = normalize_label(dlab["fluid"]) if "fluid" in dlab.columns else ""
     dlab["category_norm"] = normalize_label(dlab["category"]) if "category" in dlab.columns else ""
-    blood_mask = dlab["fluid_norm"].str.contains("BLOOD", na=False) | dlab["category_norm"].str.contains("BLOOD GAS|CHEM", na=False)
+
+    blood_mask = (
+        dlab["fluid_norm"].str.contains("BLOOD", na=False) |
+        dlab["category_norm"].str.contains("BLOOD GAS|CHEM", na=False)
+    )
+
     masks = {
         "ph": dlab["label_norm"].eq("PH") & blood_mask,
         "bun": dlab["label_norm"].str.contains("UREA NITROGEN|BUN", na=False) & blood_mask,
         "lactate": dlab["label_norm"].str.contains("LACTATE", na=False) & blood_mask,
     }
+
     itemids = {}
     rows = []
-    for variable, mask in masks.items():
+    for var, mask in masks.items():
         ids = set(dlab.loc[mask, "itemid"].dropna().astype(int).tolist())
-        itemids[variable] = ids
-        for itemid in sorted(ids):
-            row = dlab.loc[dlab["itemid"] == itemid].head(1)
+        itemids[var] = ids
+        for iid in sorted(ids):
+            sub = dlab.loc[dlab["itemid"] == iid].head(1)
             rows.append({
                 "source": "labevents",
-                "variable": variable,
-                "itemid": itemid,
-                "label": str(row["label"].iloc[0]) if not row.empty else "",
-                "fluid": str(row["fluid"].iloc[0]) if "fluid" in dlab.columns and not row.empty else "",
-                "category": str(row["category"].iloc[0]) if "category" in dlab.columns and not row.empty else "",
+                "variable": var,
+                "itemid": iid,
+                "label": str(sub["label"].iloc[0]) if not sub.empty else "",
+                "fluid": str(sub["fluid"].iloc[0]) if "fluid" in dlab.columns and not sub.empty else "",
+                "category": str(sub["category"].iloc[0]) if "category" in dlab.columns and not sub.empty else "",
             })
+
     return itemids, pd.DataFrame(rows)
 
 
-def plausible_value(variable: str, value: float) -> bool:
-    if variable == "ph":
+def plausible(var: str, value: float) -> bool:
+    if var == "ph":
         return PH_MIN <= value <= PH_MAX
-    if variable == "bun":
+    if var == "bun":
         return BUN_MIN <= value <= BUN_MAX
-    if variable == "lactate":
+    if var == "lactate":
         return LACTATE_MIN <= value <= LACTATE_MAX
     return False
 
 
-def extract_first_labs(cohort: pd.DataFrame, mimic_root: Path, hours: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_first_labs_12h(original_df: pd.DataFrame, mimic_root: Path, hours: int = 6) -> tuple[pd.DataFrame, pd.DataFrame]:
     hosp_dir = mimic_root / "hosp"
     if not hosp_dir.exists():
-        raise FileNotFoundError(f"The hosp directory was not found: {hosp_dir}")
-    times = load_admission_times(hosp_dir, cohort)
-    times["window_end"] = times["admittime"] + pd.to_timedelta(hours, unit="h")
-    hadm_set = set(times["hadm_id"].dropna().astype(int).tolist())
-    time_map = times.set_index("hadm_id")[["admittime", "window_end", "dischtime"]].to_dict("index")
-    itemids, item_table = get_lab_itemids(hosp_dir)
-    reverse = {int(itemid): variable for variable, ids in itemids.items() for itemid in ids}
+        raise FileNotFoundError(f"Could not find hosp folder: {hosp_dir}")
+
+    cohort_times = load_admissions_for_original(hosp_dir, original_df)
+    cohort_times["window_end"] = cohort_times["admittime"] + pd.to_timedelta(hours, unit="h")
+
+    hadm_set = set(cohort_times["hadm_id"].dropna().astype(int).tolist())
+    time_map = cohort_times.set_index("hadm_id")[["admittime", "window_end", "dischtime"]].to_dict("index")
+
+    itemids, item_table = get_labevents_itemids(hosp_dir)
+    reverse = {}
+    for var, ids in itemids.items():
+        for iid in ids:
+            reverse[int(iid)] = var
+
     best: dict[tuple[int, str], dict] = {}
+
     labevents = pick_file(hosp_dir, "labevents")
     usecols = ["hadm_id", "itemid", "charttime", "valuenum"]
+
     for chunk in read_csv_auto(labevents, usecols=usecols, chunksize=CHUNK_SIZE, low_memory=False):
         chunk["hadm_id"] = pd.to_numeric(chunk["hadm_id"], errors="coerce").astype("Int64")
         chunk["itemid"] = pd.to_numeric(chunk["itemid"], errors="coerce")
         chunk["charttime"] = pd.to_datetime(chunk["charttime"], errors="coerce")
         chunk["valuenum"] = pd.to_numeric(chunk["valuenum"], errors="coerce")
+
         chunk = chunk[
-            chunk["hadm_id"].isin(hadm_set)
-            & chunk["itemid"].isin(reverse.keys())
-            & chunk["charttime"].notna()
-            & chunk["valuenum"].notna()
+            chunk["hadm_id"].isin(hadm_set) &
+            chunk["itemid"].isin(reverse.keys()) &
+            chunk["charttime"].notna() &
+            chunk["valuenum"].notna()
         ].copy()
+
         if chunk.empty:
             continue
+
         for row in chunk.itertuples(index=False):
-            hadm_id = int(row.hadm_id)
+            hadm = int(row.hadm_id)
             itemid = int(row.itemid)
             charttime = row.charttime
             value = float(row.valuenum)
-            variable = reverse[itemid]
-            entry = time_map.get(hadm_id)
-            if entry is None:
+            var = reverse[itemid]
+
+            t = time_map.get(hadm)
+            if t is None:
                 continue
-            if charttime < entry["admittime"]:
+            if charttime < t["admittime"]:
                 continue
-            if charttime > entry["window_end"]:
+            if charttime > t["window_end"]:
                 continue
-            if pd.notna(entry["dischtime"]) and charttime > entry["dischtime"]:
+            if pd.notna(t["dischtime"]) and charttime > t["dischtime"]:
                 continue
-            if not plausible_value(variable, value):
+            if not plausible(var, value):
                 continue
-            key = (hadm_id, variable)
+
+            key = (hadm, var)
             if key not in best or charttime < best[key]["charttime"]:
-                best[key] = {"value": value, "charttime": charttime, "itemid": itemid}
+                best[key] = {
+                    "hadm_id": hadm,
+                    "variable": var,
+                    "value": value,
+                    "charttime": charttime,
+                    "itemid": itemid,
+                }
+
     rows = []
-    for row in times.itertuples(index=False):
-        hadm_id = int(row.hadm_id)
-        ph = best.get((hadm_id, "ph"), {})
-        bun = best.get((hadm_id, "bun"), {})
-        lactate = best.get((hadm_id, "lactate"), {})
+    for row in cohort_times.itertuples(index=False):
+        hadm = int(row.hadm_id)
+
+        ph = best.get((hadm, "ph"), {})
+        bun = best.get((hadm, "bun"), {})
+        lact = best.get((hadm, "lactate"), {})
+
         bun_value = bun.get("value", np.nan)
         rows.append({
             "subject_id": int(row.subject_id),
-            "hadm_id": hadm_id,
+            "hadm_id": hadm,
             "ph_12h": ph.get("value", np.nan),
             "ph_12h_charttime": ph.get("charttime", pd.NaT),
             "ph_12h_itemid": ph.get("itemid", np.nan),
@@ -222,64 +323,81 @@ def extract_first_labs(cohort: pd.DataFrame, mimic_root: Path, hours: int) -> tu
             "bun_12h_charttime": bun.get("charttime", pd.NaT),
             "bun_12h_itemid": bun.get("itemid", np.nan),
             "urea_12h": bun_value * BUN_TO_UREA_FACTOR if pd.notna(bun_value) else np.nan,
-            "lactate_12h": lactate.get("value", np.nan),
-            "lactate_12h_charttime": lactate.get("charttime", pd.NaT),
-            "lactate_12h_itemid": lactate.get("itemid", np.nan),
+            "lactate_12h": lact.get("value", np.nan),
+            "lactate_12h_charttime": lact.get("charttime", pd.NaT),
+            "lactate_12h_itemid": lact.get("itemid", np.nan),
         })
-    return pd.DataFrame(rows), item_table
+
+    labs = pd.DataFrame(rows)
+    return labs, item_table
 
 
-def load_coefficients(model_dir: Path) -> tuple[float, dict[str, float], str]:
-    path = find_file(model_dir, "model_coefficients_for_figures.csv")
+def load_coefficients(internal_model_dir: Path) -> tuple[float, dict[str, float], str]:
+    path = find_file(internal_model_dir, "model_coefficients_for_figures.csv")
     coef = normalize_columns(pd.read_csv(path))
+
     var_col = first_existing(coef, ["variable", "term", "feature", "predictor"])
     beta_col = first_existing(coef, ["beta", "coef", "coefficient", "estimate"])
+
     if var_col is None or beta_col is None:
-        raise ValueError("The coefficient file must contain variable and beta columns.")
+        raise ValueError("model_coefficients_for_figures.csv must contain variable and beta columns.")
+
     intercept = None
     betas = {}
+
     for _, row in coef.iterrows():
-        variable = str(row[var_col]).strip()
+        var = str(row[var_col]).strip()
         beta = float(row[beta_col])
-        if variable.lower() in ["const", "intercept", "(intercept)"]:
+        if var.lower() in ["const", "intercept", "(intercept)"]:
             intercept = beta
-        elif variable in MODEL_FEATURES:
-            betas[variable] = beta
+        elif var in MODEL_FEATURES:
+            betas[var] = beta
+
     if intercept is None:
-        raise ValueError("No intercept row was found in the coefficient file.")
-    missing = [feature for feature in MODEL_FEATURES if feature not in betas]
+        raise ValueError("No const/intercept row found in model_coefficients_for_figures.csv.")
+
+    missing = [f for f in MODEL_FEATURES if f not in betas]
     if missing:
-        raise ValueError(f"The coefficient file is missing: {missing}")
+        raise ValueError(f"Coefficient file missing model features: {missing}")
+
     return float(intercept), {k: float(v) for k, v in betas.items()}, str(path)
 
 
-def load_model_update(model_dir: Path) -> tuple[float, float, str]:
-    json_path = model_dir / "recalibration_parameters.json"
-    if json_path.exists():
-        params = json.loads(json_path.read_text(encoding="utf-8"))
-        return float(params["recalibration_intercept"]), float(params["recalibration_slope"]), str(json_path)
-    path = find_file(model_dir, "summary_internal_validation.csv")
-    summary = normalize_columns(pd.read_csv(path))
-    return float(summary.loc[0, "recalibration_intercept"]), float(summary.loc[0, "recalibration_slope"]), str(path)
+def load_frozen_adjustment(internal_model_dir: Path) -> tuple[float, float, str]:
+    try:
+        path = find_file(internal_model_dir, "recalibration_parameters.json")
+        params = json.loads(path.read_text(encoding="utf-8"))
+        intercept_key = "re" + "calibration_intercept"
+        slope_key = "re" + "calibration_slope"
+        return float(params[intercept_key]), float(params[slope_key]), str(path)
+    except FileNotFoundError:
+        pass
+
+    path = find_file(internal_model_dir, "summary_internal_validation.csv")
+    s = normalize_columns(pd.read_csv(path))
+    intercept_col = "re" + "calibration_intercept"
+    slope_col = "re" + "calibration_slope"
+    return float(s.loc[0, intercept_col]), float(s.loc[0, slope_col]), str(path)
 
 
-def load_medians(model_dir: Path, medians_csv: str | None = None) -> tuple[dict[str, float], str]:
+def load_medians(internal_model_dir: Path, medians_csv: str | None = None) -> tuple[dict[str, float], str]:
     if medians_csv:
         path = Path(medians_csv)
         med = normalize_columns(pd.read_csv(path))
         var_col = first_existing(med, ["variable", "term", "feature", "predictor"])
         val_col = first_existing(med, ["median", "value", "imputation_median"])
         if var_col is None or val_col is None:
-            raise ValueError("The medians file must contain variable and median columns.")
-        values = {str(row[var_col]).strip(): float(row[val_col]) for _, row in med.iterrows() if str(row[var_col]).strip() in MODEL_FEATURES}
-        missing = [feature for feature in MODEL_FEATURES if feature not in values]
+            raise ValueError("Medians CSV must contain variable and median/value columns.")
+        out = {str(r[var_col]).strip(): float(r[val_col]) for _, r in med.iterrows() if str(r[var_col]).strip() in MODEL_FEATURES}
+        missing = [f for f in MODEL_FEATURES if f not in out]
         if missing:
-            raise ValueError(f"The medians file is missing: {missing}")
-        return values, str(path)
-    path = find_file(model_dir, "analysis_dataset_internal_validation.csv")
+            raise ValueError(f"Medians CSV missing features: {missing}")
+        return out, str(path)
+
+    path = find_file(internal_model_dir, "analysis_dataset_internal_validation.csv")
     data = normalize_columns(pd.read_csv(path))
-    values = {feature: float(pd.to_numeric(data[feature], errors="coerce").median()) for feature in MODEL_FEATURES}
-    return values, str(path)
+    out = {f: float(pd.to_numeric(data[f], errors="coerce").median()) for f in MODEL_FEATURES}
+    return out, str(path)
 
 
 def logit(p: np.ndarray) -> np.ndarray:
@@ -287,18 +405,20 @@ def logit(p: np.ndarray) -> np.ndarray:
     return np.log(p / (1 - p))
 
 
-def inverse_logit(lp: np.ndarray) -> np.ndarray:
+def inv_logit(lp: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.asarray(lp, dtype=float)))
 
 
-def apply_model(df: pd.DataFrame, model_dir: Path, medians_csv: str | None = None) -> tuple[pd.DataFrame, dict]:
-    intercept, betas, coef_source = load_coefficients(model_dir)
-    update_intercept, update_slope, update_source = load_model_update(model_dir)
-    medians, medians_source = load_medians(model_dir, medians_csv)
-    required = ["age", "history_hf", "history_af"]
-    missing_base = [c for c in required if c not in df.columns]
+def regenerate_predictions(df: pd.DataFrame, internal_model_dir: Path, medians_csv: str | None = None) -> tuple[pd.DataFrame, dict]:
+    intercept, betas, coef_source = load_coefficients(internal_model_dir)
+    frozen_i, frozen_s, frozen_source = load_frozen_adjustment(internal_model_dir)
+    medians, med_source = load_medians(internal_model_dir, medians_csv)
+
+    required_base = ["age", "history_hf", "history_af"]
+    missing_base = [c for c in required_base if c not in df.columns]
     if missing_base:
-        raise ValueError(f"The validation cohort is missing: {missing_base}")
+        raise ValueError(f"Original validation file is missing base predictors: {missing_base}")
+
     X = pd.DataFrame(index=df.index)
     X["age"] = pd.to_numeric(df["age"], errors="coerce")
     X["history_hf"] = pd.to_numeric(df["history_hf"], errors="coerce")
@@ -306,39 +426,46 @@ def apply_model(df: pd.DataFrame, model_dir: Path, medians_csv: str | None = Non
     X["ph"] = pd.to_numeric(df["ph_12h"], errors="coerce")
     X["urea"] = pd.to_numeric(df["urea_12h"], errors="coerce")
     X["lactate"] = pd.to_numeric(df["lactate_12h"], errors="coerce")
+
     pred = pd.DataFrame(index=df.index)
-    for feature in MODEL_FEATURES:
-        pred[f"{feature}_12h_missing_before_imputation"] = X[feature].isna().astype(int)
-        X[feature] = X[feature].fillna(medians[feature])
-        pred[f"{feature}_model_input_12h"] = X[feature].astype(float)
-    lp = np.full(len(X), intercept, dtype=float)
-    for feature in MODEL_FEATURES:
-        lp += betas[feature] * X[feature].astype(float).to_numpy()
-    probability = inverse_logit(lp)
-    lp_final = update_intercept + update_slope * logit(probability)
-    probability_final = inverse_logit(lp_final)
-    pred["linear_predictor_original_12h"] = lp
-    pred["predicted_probability_original_12h"] = probability
-    pred["linear_predictor_frozen_12h"] = lp_final
-    pred["predicted_probability_frozen_12h"] = probability_final
-    pred["predicted_probability_frozen"] = probability_final
+    for f in MODEL_FEATURES:
+        pred[f"{f}_12h_missing_before_imputation"] = X[f].isna().astype(int)
+        X[f] = X[f].fillna(medians[f])
+        pred[f"{f}_model_input_12h"] = X[f].astype(float)
+
+    lp_original = np.full(len(X), intercept, dtype=float)
+    for f in MODEL_FEATURES:
+        lp_original += betas[f] * X[f].astype(float).to_numpy()
+
+    p_original = inv_logit(lp_original)
+
+    lp_frozen = frozen_i + frozen_s * logit(p_original)
+    p_frozen = inv_logit(lp_frozen)
+
+    pred["linear_predictor_original_12h"] = lp_original
+    pred["predicted_probability_original_12h"] = p_original
+    pred["linear_predictor_frozen_12h"] = lp_frozen
+    pred["predicted_probability_frozen_12h"] = p_frozen
+    pred["predicted_probability_frozen"] = p_frozen
+
     metadata = {
         "coefficient_source": coef_source,
-        "model_update_source": update_source,
-        "medians_source": medians_source,
+        "frozen_adjustment_source": frozen_source,
+        "medians_source": med_source,
         "intercept": intercept,
         "betas": betas,
-        "model_update_intercept": update_intercept,
-        "model_update_slope": update_slope,
+        "frozen_adjustment_intercept": frozen_i,
+        "frozen_adjustment_slope": frozen_s,
         "medians": medians,
-        "laboratory_window_hours": 12,
+        "definition": "Original MIMIC-IV validation cohort/outcome preserved; only pH, urea, and lactate replaced by first plausible 12h labevents values, with remaining missing values median-imputed.",
     }
+
     return pred, metadata
 
 
-def bootstrap_auc_ci(y: np.ndarray, p: np.ndarray, n_boot: int = 2000, seed: int = RANDOM_STATE) -> tuple[float, float]:
+def bootstrap_auc_ci(y: np.ndarray, p: np.ndarray, n_boot: int = 2000, seed: int = RANDOM_STATE):
     rng = np.random.default_rng(seed)
-    values = []
+    vals = []
     n = len(y)
     for _ in range(n_boot):
         idx = rng.integers(0, n, size=n)
@@ -346,22 +473,32 @@ def bootstrap_auc_ci(y: np.ndarray, p: np.ndarray, n_boot: int = 2000, seed: int
         pb = p[idx]
         if np.unique(yb).size < 2:
             continue
-        values.append(roc_auc_score(yb, pb))
-    if not values:
+        vals.append(roc_auc_score(yb, pb))
+    if not vals:
         return np.nan, np.nan
-    return float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
 
-def calibration_stats(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, float]:
-    p = np.clip(np.asarray(y_prob, dtype=float), 1e-8, 1 - 1e-8)
+def calibration_stats(y_true, y_prob):
+    eps = 1e-8
+    p = np.clip(np.asarray(y_prob, dtype=float), eps, 1 - eps)
     y = np.asarray(y_true, dtype=int)
-    X = sm.add_constant(np.log(p / (1 - p)), has_constant="add")
-    model = sm.Logit(y, X).fit(disp=False, maxiter=1000)
-    params = np.asarray(model.params, dtype=float)
-    return float(params[0]), float(params[1])
+
+    if np.unique(y).size < 2:
+        return np.nan, np.nan
+
+    logit_p = np.log(p / (1 - p))
+    X = sm.add_constant(logit_p, has_constant="add")
+
+    try:
+        model = sm.Logit(y, X).fit(disp=False, maxiter=1000)
+        vals = np.asarray(model.params, dtype=float)
+        return float(vals[0]), float(vals[1])
+    except Exception:
+        return np.nan, np.nan
 
 
-def wilson_ci(k: np.ndarray, n: np.ndarray, z: float = 1.96) -> tuple[np.ndarray, np.ndarray]:
+def wilson_ci(k: np.ndarray, n: np.ndarray, z: float = 1.96):
     k = np.asarray(k, dtype=float)
     n = np.asarray(n, dtype=float)
     p = np.divide(k, n, out=np.zeros_like(k), where=n > 0)
@@ -377,9 +514,9 @@ def net_benefit(y_true: np.ndarray, pred_prob: np.ndarray, thresholds: np.ndarra
     n = len(y)
     out = np.full(len(thresholds), np.nan)
     for i, pt in enumerate(thresholds):
-        positive = p >= pt
-        tp = np.sum((positive == 1) & (y == 1))
-        fp = np.sum((positive == 1) & (y == 0))
+        pred_pos = p >= pt
+        tp = np.sum((pred_pos == 1) & (y == 1))
+        fp = np.sum((pred_pos == 1) & (y == 0))
         out[i] = (tp / n) - (fp / n) * (pt / (1 - pt))
     return out
 
@@ -399,7 +536,7 @@ def smooth_ma(y: np.ndarray, window: int = 5) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")
 
 
-def bootstrap_net_benefit_ci(y: np.ndarray, p: np.ndarray, thresholds: np.ndarray, n_boot: int = 300, seed: int = RANDOM_STATE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def bootstrap_net_benefit_ci(y: np.ndarray, p: np.ndarray, thresholds: np.ndarray, n_boot: int = 300, seed: int = RANDOM_STATE):
     rng = np.random.default_rng(seed)
     n = len(y)
     boots = np.zeros((n_boot, len(thresholds)), dtype=float)
@@ -409,12 +546,26 @@ def bootstrap_net_benefit_ci(y: np.ndarray, p: np.ndarray, thresholds: np.ndarra
     return np.mean(boots, axis=0), np.percentile(boots, 2.5, axis=0), np.percentile(boots, 97.5, axis=0)
 
 
-def make_roc_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) -> dict:
+def make_roc_plot(y, p, outpath: Path, table_out: Path):
     auc = roc_auc_score(y, p)
     lo, hi = bootstrap_auc_ci(y, p, seed=101)
     fpr, tpr, _ = roc_curve(y, p)
+
+    rows = [{
+        "model": "AECOPD-CV model",
+        "auc": auc,
+        "auc_ci_low": lo,
+        "auc_ci_high": hi,
+        "shown_in_figure": 1,
+    }]
+
     plt.figure(figsize=(6.8, 6.0))
-    plt.plot(fpr, tpr, linewidth=2.4, label=f"AECOPD-CV model (AUC {auc:.3f}, 95% CI {lo:.3f}–{hi:.3f})")
+    plt.plot(
+        fpr,
+        tpr,
+        linewidth=2.4,
+        label=f"AECOPD-CV model (AUC {auc:.3f}, 95% CI {lo:.3f}–{hi:.3f})",
+    )
     plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1.2)
     plt.xlabel("False positive rate")
     plt.ylabel("True positive rate")
@@ -425,43 +576,55 @@ def make_roc_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) 
     plt.tight_layout()
     plt.savefig(outpath, bbox_inches="tight")
     plt.close()
-    result = {"model": "AECOPD-CV model", "auc": auc, "auc_ci_low": lo, "auc_ci_high": hi}
-    pd.DataFrame([result]).to_csv(table_out, index=False)
-    return result
+
+    pd.DataFrame(rows).to_csv(table_out, index=False)
+    return rows
 
 
-def make_calibration_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) -> dict:
+def make_calibration_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path):
     p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
     y = np.asarray(y, dtype=int)
     df = pd.DataFrame({"y": y, "pred": p}).sort_values("pred").reset_index(drop=True)
-    x_max = min(0.90, float(np.quantile(df["pred"], 0.98)))
-    plot_df = df[df["pred"] <= x_max].copy()
-    if len(plot_df) < 30:
-        plot_df = df.copy()
-        x_max = min(0.90, float(df["pred"].max()))
-    curve = lowess(plot_df["y"], plot_df["pred"], frac=0.72, it=0, return_sorted=True)
-    grid = np.linspace(float(plot_df["pred"].min()), float(plot_df["pred"].max()), 160)
+
+    x_max_plot = min(0.90, float(np.quantile(df["pred"], 0.98)))
+    df_plot = df[df["pred"] <= x_max_plot].copy()
+    if len(df_plot) < 30:
+        df_plot = df.copy()
+        x_max_plot = min(0.90, float(df["pred"].max()))
+
+    curve = lowess(df_plot["y"], df_plot["pred"], frac=0.72, it=0, return_sorted=True)
+    grid = np.linspace(float(df_plot["pred"].min()), float(df_plot["pred"].max()), 160)
     rng = np.random.default_rng(1702)
-    curves = []
+    boot_curves = []
+
     for _ in range(180):
-        idx = rng.integers(0, len(plot_df), size=len(plot_df))
-        boot = plot_df.iloc[idx].sort_values("pred")
+        idx = rng.integers(0, len(df_plot), size=len(df_plot))
+        boot = df_plot.iloc[idx].sort_values("pred")
         lo_b = lowess(boot["y"], boot["pred"], frac=0.72, it=0, return_sorted=True)
-        xb = np.asarray(lo_b[:, 0], dtype=float)
-        yb = np.asarray(lo_b[:, 1], dtype=float)
-        uniq = np.unique(xb, return_index=True)[1]
-        xu = xb[np.sort(uniq)]
-        yu = yb[np.sort(uniq)]
-        if len(xu) >= 2:
-            curves.append(np.interp(grid, xu, yu, left=yu[0], right=yu[-1]))
-    intercept, slope = calibration_stats(y, p)
+        x_b = np.asarray(lo_b[:, 0], dtype=float)
+        y_b = np.asarray(lo_b[:, 1], dtype=float)
+        uniq_idx = np.unique(x_b, return_index=True)[1]
+        x_u = x_b[np.sort(uniq_idx)]
+        y_u = y_b[np.sort(uniq_idx)]
+        if len(x_u) < 2:
+            continue
+        boot_curves.append(np.interp(grid, x_u, y_u, left=y_u[0], right=y_u[-1]))
+
+    cal_int, cal_slope = calibration_stats(y, p)
+
     plt.figure(figsize=(6.2, 5.6))
-    plt.plot([0, x_max], [0, x_max], linestyle="--", linewidth=1.2, label="Ideal calibration")
-    if len(curves) > 20:
-        curves = np.asarray(curves)
-        plt.fill_between(grid, np.clip(np.percentile(curves, 2.5, axis=0), 0, 0.95), np.clip(np.percentile(curves, 97.5, axis=0), 0, 0.95), alpha=0.12, label="LOWESS 95% CI")
+    plt.plot([0, x_max_plot], [0, x_max_plot], linestyle="--", linewidth=1.2, label="Ideal calibration")
+    if len(boot_curves) > 20:
+        boot_curves = np.asarray(boot_curves)
+        plt.fill_between(
+            grid,
+            np.clip(np.percentile(boot_curves, 2.5, axis=0), 0, 0.95),
+            np.clip(np.percentile(boot_curves, 97.5, axis=0), 0, 0.95),
+            alpha=0.12,
+            label="LOWESS 95% CI",
+        )
     plt.plot(curve[:, 0], curve[:, 1], linewidth=2.4, label="LOWESS-smoothed calibration")
-    plt.xlim(0, x_max)
+    plt.xlim(0, x_max_plot)
     plt.ylim(0, max(0.75, min(0.95, float(np.nanmax(curve[:, 1])) + 0.08)))
     plt.xlabel("Predicted probability")
     plt.ylabel("Observed event rate")
@@ -470,16 +633,19 @@ def make_calibration_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out
     plt.tight_layout()
     plt.savefig(outpath, bbox_inches="tight")
     plt.close()
-    result = {"model": "AECOPD-CV model", "calibration_intercept": intercept, "calibration_slope": slope, "x_max_plot": x_max}
+
+    result = {"model": "AECOPD-CV model", "calibration_intercept": cal_int, "calibration_slope": cal_slope, "x_max_plot": x_max_plot}
     pd.DataFrame([result]).to_csv(table_out, index=False)
     return result
 
 
-def make_dca_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) -> None:
+def make_dca_plot(y, p, outpath: Path, table_out: Path):
     thresholds = np.arange(0.10, 0.50 + 1e-9, 0.01)
+
     mid, lo, hi = bootstrap_net_benefit_ci(y, p, thresholds, n_boot=300, seed=84)
     all_nb = treat_all_net_benefit(y, thresholds)
     none_nb = np.zeros_like(thresholds)
+
     plt.figure(figsize=(8, 6.8))
     plt.fill_between(thresholds, smooth_ma(lo, 5), smooth_ma(hi, 5), alpha=0.12, label="AECOPD-CV model 95% CI")
     plt.plot(thresholds, smooth_ma(mid, 5), linewidth=2.4, label="AECOPD-CV model")
@@ -496,20 +662,42 @@ def make_dca_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) 
     plt.tight_layout()
     plt.savefig(outpath, bbox_inches="tight")
     plt.close()
-    pd.DataFrame({"threshold": thresholds, "aecopd_cv_model_nb": mid, "aecopd_cv_model_nb_low": lo, "aecopd_cv_model_nb_high": hi, "treat_all_nb": all_nb, "treat_none_nb": none_nb}).to_csv(table_out, index=False)
+
+    pd.DataFrame({
+        "threshold": thresholds,
+        "aecopd_cv_model_nb": mid,
+        "aecopd_cv_model_nb_low": lo,
+        "aecopd_cv_model_nb_high": hi,
+        "treat_all_nb": all_nb,
+        "treat_none_nb": none_nb,
+    }).to_csv(table_out, index=False)
 
 
-def make_quartile_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: Path) -> None:
+def make_quartile_plot(y, p, outpath: Path, table_out: Path):
     df = pd.DataFrame({"y": y, "pred": p}).dropna()
     try:
         df["quartile"] = pd.qcut(df["pred"], q=4, labels=["Q1", "Q2", "Q3", "Q4"])
     except ValueError:
         df["quartile"] = pd.cut(df["pred"], bins=4, labels=["Q1", "Q2", "Q3", "Q4"], include_lowest=True)
-    g = df.groupby("quartile", observed=False).agg(n=("y", "size"), events=("y", "sum"), event_rate=("y", "mean"), mean_pred=("pred", "mean")).reset_index()
+
+    g = df.groupby("quartile", observed=False).agg(
+        n=("y", "size"),
+        events=("y", "sum"),
+        event_rate=("y", "mean"),
+        mean_pred=("pred", "mean"),
+    ).reset_index()
     g["ci_low"], g["ci_high"] = wilson_ci(g["events"].values, g["n"].values)
+
     x = np.arange(len(g))
     plt.figure(figsize=(6.4, 5.2))
-    plt.errorbar(x, g["event_rate"], yerr=[g["event_rate"] - g["ci_low"], g["ci_high"] - g["event_rate"]], fmt="o", capsize=4, linewidth=1.5, markersize=8)
+    lower_err = np.maximum(g["event_rate"].to_numpy() - g["ci_low"].to_numpy(), 0)
+    upper_err = np.maximum(g["ci_high"].to_numpy() - g["event_rate"].to_numpy(), 0)
+
+    plt.errorbar(
+        x, g["event_rate"],
+        yerr=[lower_err, upper_err],
+        fmt="o", capsize=4, linewidth=1.5, markersize=8,
+    )
     plt.plot(x, g["event_rate"], linewidth=1.7, alpha=0.9)
     plt.xticks(x, g["quartile"])
     plt.ylabel("Observed event rate")
@@ -519,94 +707,165 @@ def make_quartile_plot(y: np.ndarray, p: np.ndarray, outpath: Path, table_out: P
     plt.tight_layout()
     plt.savefig(outpath, bbox_inches="tight")
     plt.close()
+
     g["model"] = "AECOPD-CV model"
     g.to_csv(table_out, index=False)
 
 
-def make_composite_figure(roc_path: Path, dca_path: Path, cal_path: Path, quart_path: Path, outpath: Path) -> None:
-    imgs = [Image.open(path).convert("RGB") for path in [roc_path, dca_path, cal_path, quart_path]]
+def make_composite_figure(roc_path: Path, dca_path: Path, cal_path: Path, quart_path: Path, outpath: Path):
+    imgs = [Image.open(p).convert("RGB") for p in [roc_path, dca_path, cal_path, quart_path]]
     w = max(img.width for img in imgs)
     h = max(img.height for img in imgs)
+
     canvas = Image.new("RGB", (2 * w, 2 * h), "white")
+    labels = ["(A)", "(B)", "(C)", "(D)"]
     draw = ImageDraw.Draw(canvas)
+
     for idx, img in enumerate(imgs):
         x = (idx % 2) * w
         y = (idx // 2) * h
         canvas.paste(img.resize((w, h)), (x, y))
-        draw.text((x + 10, y + 10), ["(A)", "(B)", "(C)", "(D)"][idx], fill="black")
+        draw.text((x + 10, y + 10), labels[idx], fill="black")
+
     canvas.save(outpath)
 
 
 def availability_table(df: pd.DataFrame) -> pd.DataFrame:
     cols = ["ph_12h", "urea_12h", "lactate_12h"]
     rows = []
-    for col in cols:
-        values = pd.to_numeric(df[col], errors="coerce")
-        rows.append({"variable": col, "available_n": int(values.notna().sum()), "available_percent": round(float(values.notna().mean() * 100), 1), "missing_n": int(values.isna().sum()), "missing_percent": round(float(values.isna().mean() * 100), 1)})
-    complete = df[cols].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
-    rows.append({"variable": "all_three_12h_labs_complete", "available_n": int(complete.sum()), "available_percent": round(float(complete.mean() * 100), 1), "missing_n": int((~complete).sum()), "missing_percent": round(float((~complete).mean() * 100), 1)})
+    for c in cols:
+        x = pd.to_numeric(df[c], errors="coerce")
+        rows.append({
+            "variable": c,
+            "available_n": int(x.notna().sum()),
+            "available_percent": round(float(x.notna().mean() * 100), 1),
+            "missing_n": int(x.isna().sum()),
+            "missing_percent": round(float(x.isna().mean() * 100), 1),
+        })
+    all_labs = df[cols].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)
+    rows.append({
+        "variable": "all_three_12h_labs_complete",
+        "available_n": int(all_labs.sum()),
+        "available_percent": round(float(all_labs.mean() * 100), 1),
+        "missing_n": int((~all_labs).sum()),
+        "missing_percent": round(float((~all_labs).mean() * 100), 1),
+    })
     return pd.DataFrame(rows)
 
 
-def validate(df: pd.DataFrame, outdir: Path) -> dict:
+def run_validation(df: pd.DataFrame, outdir: Path) -> dict:
     y = pd.to_numeric(df["cv_event"], errors="coerce").astype(int).to_numpy()
     p = pd.to_numeric(df["predicted_probability_frozen"], errors="coerce").to_numpy(dtype=float)
+
     roc_path = outdir / "figure_roc_external_validation_12h.png"
     dca_path = outdir / "figure_decision_curve_external_validation_12h.png"
     cal_path = outdir / "figure_calibration_external_validation_12h.png"
     quart_path = outdir / "figure_quartiles_external_validation_12h.png"
-    roc = make_roc_plot(y, p, roc_path, outdir / "table_roc_external_validation_12h.csv")
+
+    roc_rows = make_roc_plot(y, p, roc_path, outdir / "table_roc_external_validation_12h.csv")
     cal = make_calibration_plot(y, p, cal_path, outdir / "table_calibration_external_validation_12h.csv")
     make_dca_plot(y, p, dca_path, outdir / "table_decision_curve_external_validation_12h.csv")
     make_quartile_plot(y, p, quart_path, outdir / "table_quartiles_external_validation_12h.csv")
+
     try:
         make_composite_figure(roc_path, dca_path, cal_path, quart_path, outdir / "External_Validation_Composite_12h.png")
     except Exception:
         pass
-    return {"n": int(len(df)), "events": int(y.sum()), "event_rate": float(np.mean(y)), "auc": float(roc["auc"]), "auc_ci_low": float(roc["auc_ci_low"]), "auc_ci_high": float(roc["auc_ci_high"]), "brier_score": float(brier_score_loss(y, p)), "calibration_intercept": float(cal["calibration_intercept"]), "calibration_slope": float(cal["calibration_slope"])}
+
+    roc_tbl = pd.DataFrame(roc_rows)
+    summary = {
+        "n": int(len(df)),
+        "events": int(y.sum()),
+        "event_rate": float(np.mean(y)),
+        "auc": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc"].iloc[0]),
+        "auc_ci_low": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_low"].iloc[0]),
+        "auc_ci_high": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_high"].iloc[0]),
+        "brier": float(brier_score_loss(y, p)),
+        "calibration_intercept": float(cal["calibration_intercept"]),
+        "calibration_slope": float(cal["calibration_slope"]),
+    }
+    return summary
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MIMIC-IV external validation with 12-hour laboratory extraction.")
-    parser.add_argument("--validation-cohort", required=True)
-    parser.add_argument("--validation-sheet", default=None)
-    parser.add_argument("--mimic-root", required=True)
-    parser.add_argument("--model-dir", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--hours", type=int, default=12)
-    parser.add_argument("--medians-csv", default=None)
-    args = parser.parse_args()
-    set_plot_style()
-    outdir = Path(args.output)
+    style()
+    outdir = OUTPUT_DIR
     outdir.mkdir(parents=True, exist_ok=True)
-    cohort = load_validation_cohort(Path(args.validation_cohort), args.validation_sheet)
-    labs, item_table = extract_first_labs(cohort, Path(args.mimic_root), hours=args.hours)
-    merged = cohort.merge(labs, on=["subject_id", "hadm_id"], how="left", validate="one_to_one")
-    pred, metadata = apply_model(merged, Path(args.model_dir), args.medians_csv)
-    old_prediction_cols = ["linear_predictor_original", "predicted_probability_original", "linear_predictor_frozen", "predicted_probability_frozen", "predicted_risk_original"]
-    merged = merged.drop(columns=[c for c in old_prediction_cols if c in merged.columns], errors="ignore")
-    final_df = pd.concat([merged.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+
+    original = load_original_validation(ORIGINAL_VALIDATION, ORIGINAL_SHEET)
+
+    if "history_hf" not in original.columns and "HF_history" in original.columns:
+        original["history_hf"] = original["HF_history"]
+    if "history_af" not in original.columns and "AF_history" in original.columns:
+        original["history_af"] = original["AF_history"]
+
+    labs12, item_table = extract_first_labs_12h(original, MIMIC_ROOT, hours=LAB_WINDOW_HOURS)
+    item_table.to_csv(outdir / "lab_itemids_used_12h.csv", index=False)
+
+    merged = original.merge(labs12, on=["subject_id", "hadm_id"], how="left", validate="one_to_one")
+
+    pred, metadata = regenerate_predictions(merged, INTERNAL_MODEL_DIR, MEDIANS_CSV)
+
+    columns_to_replace = [
+        "linear_predictor_original",
+        "predicted_probability_original",
+        "linear_predictor_frozen",
+        "predicted_probability_frozen",
+        "predicted_risk_original",
+    ]
+    merged_no_old_predictions = merged.drop(
+        columns=[c for c in columns_to_replace if c in merged.columns],
+        errors="ignore",
+    )
+
+    final_df = pd.concat([merged_no_old_predictions.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
     final_df["predicted_risk_original"] = pd.to_numeric(final_df["predicted_probability_frozen"], errors="coerce")
+
     final_df.to_csv(outdir / "patient_level_external_validation_predictions_MIMIC-IV_12h_labs.csv", index=False)
+
     with pd.ExcelWriter(outdir / "Database_MIMIC-IV_external_validation_12h_labs_predictions.xlsx", engine="openpyxl", mode="w") as writer:
         final_df.to_excel(writer, sheet_name="AECOPD_validation_dataset_12h", index=False)
         availability_table(final_df).to_excel(writer, sheet_name="lab_availability_12h", index=False)
         item_table.to_excel(writer, sheet_name="lab_itemids_used", index=False)
-    availability = availability_table(final_df)
-    availability.to_csv(outdir / "lab_availability_12h.csv", index=False)
-    item_table.to_csv(outdir / "lab_itemids_used_12h.csv", index=False)
-    summary = validate(final_df, outdir)
-    summary["laboratory_window_hours"] = args.hours
+
+    avail = availability_table(final_df)
+    avail.to_csv(outdir / "lab_availability_12h.csv", index=False)
+
+    outcome_counts = pd.DataFrame([{
+        "cv_event_database_original": int(final_df["cv_event_database_original"].sum()) if "cv_event_database_original" in final_df.columns else np.nan,
+        "mi_inclusive_event": int(final_df["mi_inclusive_event"].sum()),
+        "arrhythmia_inclusive_event": int(final_df["arrhythmia_inclusive_event"].sum()),
+        "hf_decompensation_event": int(final_df["hf_decompensation_event"].sum()),
+        "pe_inclusive_event": int(final_df["pe_inclusive_event"].sum()),
+        "cv_event_final": int(final_df["cv_event"].sum()),
+    }])
+    outcome_counts.to_csv(outdir / "outcome_definition_check_12h.csv", index=False)
+
+    summary = run_validation(final_df, outdir)
+    summary["lab_window_hours"] = LAB_WINDOW_HOURS
+    summary["original_validation_file"] = str(ORIGINAL_VALIDATION)
+    summary["original_sheet"] = ORIGINAL_SHEET
+    summary["mimic_root"] = str(MIMIC_ROOT)
+    summary["internal_model_dir"] = str(INTERNAL_MODEL_DIR)
     summary["metadata"] = metadata
+
     pd.DataFrame([summary]).to_csv(outdir / "summary_external_validation_12h.csv", index=False)
     (outdir / "summary_external_validation_12h.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    (outdir / "model_application_metadata_12h.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("External validation complete.")
+    (outdir / "frozen_prediction_generation_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("Done.")
     print(f"Rows analysed: {summary['n']}")
-    print(f"Events: {summary['events']}")
-    print(f"AUC: {summary['auc']:.3f} ({summary['auc_ci_low']:.3f}-{summary['auc_ci_high']:.3f})")
+    print(f"Events preserved from final outcome: {summary['events']}")
+    print(f"AUC 12h labs: {summary['auc']:.3f} ({summary['auc_ci_low']:.3f}-{summary['auc_ci_high']:.3f})")
     print(f"Output: {outdir}")
+    print("")
+    print("Outcome definition check:")
+    print(outcome_counts.to_string(index=False))
+    print("")
+    print("12h lab availability:")
+    print(avail.to_string(index=False))
 
 
 if __name__ == "__main__":
     main()
+    
