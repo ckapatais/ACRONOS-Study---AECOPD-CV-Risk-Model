@@ -2,7 +2,7 @@
 
 This repository contains the code, validation workflows, figures, and web calculator associated with the development and validation of the AECOPD-CV prediction model for cardiovascular complications among patients hospitalized with acute exacerbation of chronic obstructive pulmonary disease (AECOPD).
 
-The repository includes the complete analytical framework used for model development, internal validation, external validation, and sensitivity analyses.
+The repository includes the complete analytical framework used for model development, internal validation, external validation, pilot implementation evaluation, and sensitivity analyses.
 
 ## Repository Structure
 
@@ -36,6 +36,14 @@ The following laboratory extraction strategies are included:
 
 These analyses were performed to evaluate the robustness of model performance under varying conditions of laboratory availability within a heterogeneous multicentre ICU population.
 
+### Independent Temporal Pilot Implementation
+
+Contains the scripts used for independent temporal pilot implementation evaluation of the frozen AECOPD-CV model.
+
+This evaluation was performed using a separate temporal cohort of hospitalized patients with AECOPD and was designed to assess model performance during pilot implementation under real-world clinical conditions. The implementation workflow includes patient-level prediction generation, discrimination analyses, risk-distribution visualizations, and publication-ready implementation figures.
+
+No model refitting, recalibration, coefficient updating, or outcome-informed parameter estimation was performed.
+
 ### Imputation Sensitivity Analysis
 
 Contains the scripts used to evaluate model robustness under alternative missing-data handling strategies, including:
@@ -50,7 +58,15 @@ Performance was compared across discrimination, calibration, clinical utility, a
 
 ### Figures
 
-Contains all figures generated from the internal validation, external validation, and sensitivity-analysis workflows.
+Contains all figures generated during:
+
+* Internal validation
+* MIMIC-IV external validation
+* eICU external validation
+* Independent temporal pilot implementation evaluation
+* Imputation sensitivity analyses
+
+All figures were generated directly from reproducible scripted workflows and were not manually modified after generation.
 
 ### Web Calculator
 
@@ -88,6 +104,10 @@ The primary outcome was a composite cardiovascular event occurring during hospit
 
 Prospectively collected patients admitted with acute exacerbation of chronic obstructive pulmonary disease.
 
+### Independent Temporal Pilot Implementation Cohort
+
+A separate temporal cohort used for pilot implementation evaluation through structured medical-record review.
+
 ### External Validation Cohorts
 
 * MIMIC-IV database
@@ -107,13 +127,14 @@ The repository provides:
 * Internal-validation scripts
 * MIMIC-IV external-validation scripts
 * eICU external-validation scripts
+* Independent temporal pilot implementation scripts
 * Imputation sensitivity-analysis scripts
 * Figure-generation workflows
 * Patient-level prediction outputs
 * Model coefficients
 * Standalone web calculator
 
-All analyses were implemented using reproducible scripted workflows.
+All analyses were implemented using fully reproducible scripted workflows.
 
 ---
 
@@ -126,3 +147,5 @@ This repository and associated calculator are intended for research and educatio
 ## Citation
 
 If you use this repository, please cite the associated manuscript and repository DOI.
+
+---
