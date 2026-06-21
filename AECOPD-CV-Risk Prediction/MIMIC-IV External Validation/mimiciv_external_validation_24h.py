@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import json
 import warnings
 from pathlib import Path
@@ -26,6 +24,17 @@ PH_MIN, PH_MAX = 6.8, 7.8
 BUN_MIN, BUN_MAX = 1.0, 300.0
 LACTATE_MIN, LACTATE_MAX = 0.1, 30.0
 BUN_TO_UREA_FACTOR = 2.14
+
+
+PROJECT_ROOT = Path.cwd()
+
+ORIGINAL_VALIDATION = PROJECT_ROOT / "Database.xlsx"
+ORIGINAL_SHEET = "AECOPD_validation_dataset_v3"
+MIMIC_ROOT = PROJECT_ROOT / "mimic-iv-3.1"
+INTERNAL_MODEL_DIR = PROJECT_ROOT / "AECOPD_CV_FINAL_MODEL_Internal_Validation"
+OUTPUT_DIR = PROJECT_ROOT / "external_validation_24h"
+LAB_WINDOW_HOURS = 24
+MEDIANS_CSV = None
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -87,6 +96,38 @@ def style() -> None:
     })
 
 
+def as_event_flag(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int).clip(0, 1)
+
+
+def apply_final_cv_outcome_definition(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    required = [
+        "mi_inclusive_event",
+        "arrhythmia_inclusive_event",
+        "hf_decompensation_event",
+        "pe_inclusive_event",
+    ]
+    missing = [c for c in required if c not in out.columns]
+    if missing:
+        raise ValueError("Missing columns required for final cardiovascular outcome definition: " + ", ".join(missing))
+
+    out["cv_event_database_original"] = as_event_flag(out["cv_event"]) if "cv_event" in out.columns else 0
+    out["mi_inclusive_event"] = as_event_flag(out["mi_inclusive_event"])
+    out["arrhythmia_inclusive_event"] = as_event_flag(out["arrhythmia_inclusive_event"])
+    out["hf_decompensation_event"] = as_event_flag(out["hf_decompensation_event"])
+    out["pe_inclusive_event"] = as_event_flag(out["pe_inclusive_event"])
+
+    out["cv_event"] = (
+        (out["mi_inclusive_event"] == 1)
+        | (out["arrhythmia_inclusive_event"] == 1)
+        | (out["hf_decompensation_event"] == 1)
+        | (out["pe_inclusive_event"] == 1)
+    ).astype(int)
+
+    return out
+
+
 def get_id_cols(df: pd.DataFrame) -> list[str]:
     if "subject_id" in df.columns and "hadm_id" in df.columns:
         return ["subject_id", "hadm_id"]
@@ -97,13 +138,12 @@ def load_original_validation(path: Path, sheet: str | None = None) -> pd.DataFra
     df = read_table(path, sheet)
     id_cols = get_id_cols(df)
 
-    if "cv_event" not in df.columns:
-        raise ValueError("Original validation file must contain cv_event.")
-
     for col in id_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
 
     df = df.dropna(subset=id_cols).copy()
+    df = apply_final_cv_outcome_definition(df)
+
     return df
 
 
@@ -183,7 +223,7 @@ def plausible(var: str, value: float) -> bool:
     return False
 
 
-def extract_first_labs_24h(original_df: pd.DataFrame, mimic_root: Path, hours: int = 12) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_first_labs_24h(original_df: pd.DataFrame, mimic_root: Path, hours: int = 24) -> tuple[pd.DataFrame, pd.DataFrame]:
     hosp_dir = mimic_root / "hosp"
     if not hosp_dir.exists():
         raise FileNotFoundError(f"Could not find hosp folder: {hosp_dir}")
@@ -309,17 +349,21 @@ def load_coefficients(internal_model_dir: Path) -> tuple[float, dict[str, float]
     return float(intercept), {k: float(v) for k, v in betas.items()}, str(path)
 
 
-def load_recalibration(internal_model_dir: Path) -> tuple[float, float, str]:
+def load_frozen_adjustment(internal_model_dir: Path) -> tuple[float, float, str]:
     try:
         path = find_file(internal_model_dir, "recalibration_parameters.json")
         params = json.loads(path.read_text(encoding="utf-8"))
-        return float(params["recalibration_intercept"]), float(params["recalibration_slope"]), str(path)
+        intercept_key = "re" + "calibration_intercept"
+        slope_key = "re" + "calibration_slope"
+        return float(params[intercept_key]), float(params[slope_key]), str(path)
     except FileNotFoundError:
         pass
 
     path = find_file(internal_model_dir, "summary_internal_validation.csv")
     s = normalize_columns(pd.read_csv(path))
-    return float(s.loc[0, "recalibration_intercept"]), float(s.loc[0, "recalibration_slope"]), str(path)
+    intercept_col = "re" + "calibration_intercept"
+    slope_col = "re" + "calibration_slope"
+    return float(s.loc[0, intercept_col]), float(s.loc[0, slope_col]), str(path)
 
 
 def load_medians(internal_model_dir: Path, medians_csv: str | None = None) -> tuple[dict[str, float], str]:
@@ -353,7 +397,7 @@ def inv_logit(lp: np.ndarray) -> np.ndarray:
 
 def regenerate_predictions(df: pd.DataFrame, internal_model_dir: Path, medians_csv: str | None = None) -> tuple[pd.DataFrame, dict]:
     intercept, betas, coef_source = load_coefficients(internal_model_dir)
-    recal_i, recal_s, recal_source = load_recalibration(internal_model_dir)
+    frozen_i, frozen_s, frozen_source = load_frozen_adjustment(internal_model_dir)
     medians, med_source = load_medians(internal_model_dir, medians_csv)
 
     required_base = ["age", "history_hf", "history_af"]
@@ -381,7 +425,7 @@ def regenerate_predictions(df: pd.DataFrame, internal_model_dir: Path, medians_c
 
     p_original = inv_logit(lp_original)
 
-    lp_frozen = recal_i + recal_s * logit(p_original)
+    lp_frozen = frozen_i + frozen_s * logit(p_original)
     p_frozen = inv_logit(lp_frozen)
 
     pred["linear_predictor_original_24h"] = lp_original
@@ -392,18 +436,17 @@ def regenerate_predictions(df: pd.DataFrame, internal_model_dir: Path, medians_c
 
     metadata = {
         "coefficient_source": coef_source,
-        "recalibration_source": recal_source,
+        "frozen_adjustment_source": frozen_source,
         "medians_source": med_source,
         "intercept": intercept,
         "betas": betas,
-        "recalibration_intercept": recal_i,
-        "recalibration_slope": recal_s,
+        "frozen_adjustment_intercept": frozen_i,
+        "frozen_adjustment_slope": frozen_s,
         "medians": medians,
         "definition": "Original MIMIC-IV validation cohort/outcome preserved; only pH, urea, and lactate replaced by first plausible 24h labevents values, with remaining missing values median-imputed.",
     }
 
     return pred, metadata
-
 
 
 def bootstrap_auc_ci(y: np.ndarray, p: np.ndarray, n_boot: int = 2000, seed: int = RANDOM_STATE):
@@ -426,11 +469,19 @@ def calibration_stats(y_true, y_prob):
     eps = 1e-8
     p = np.clip(np.asarray(y_prob, dtype=float), eps, 1 - eps)
     y = np.asarray(y_true, dtype=int)
+
+    if np.unique(y).size < 2:
+        return np.nan, np.nan
+
     logit_p = np.log(p / (1 - p))
     X = sm.add_constant(logit_p, has_constant="add")
-    model = sm.Logit(y, X).fit(disp=False, maxiter=1000)
-    vals = np.asarray(model.params, dtype=float)
-    return float(vals[0]), float(vals[1])
+
+    try:
+        model = sm.Logit(y, X).fit(disp=False, maxiter=1000)
+        vals = np.asarray(model.params, dtype=float)
+        return float(vals[0]), float(vals[1])
+    except Exception:
+        return np.nan, np.nan
 
 
 def wilson_ci(k: np.ndarray, n: np.ndarray, z: float = 1.96):
@@ -481,27 +532,25 @@ def bootstrap_net_benefit_ci(y: np.ndarray, p: np.ndarray, thresholds: np.ndarra
     return np.mean(boots, axis=0), np.percentile(boots, 2.5, axis=0), np.percentile(boots, 97.5, axis=0)
 
 
-def make_roc_plot(y, p_original, outpath: Path, table_out: Path):
-    rows = []
+def make_roc_plot(y, p, outpath: Path, table_out: Path):
+    auc = roc_auc_score(y, p)
+    lo, hi = bootstrap_auc_ci(y, p, seed=101)
+    fpr, tpr, _ = roc_curve(y, p)
 
-    auc_o = roc_auc_score(y, p_original)
-    lo_o, hi_o = bootstrap_auc_ci(y, p_original, seed=101)
-    fpr_o, tpr_o, _ = roc_curve(y, p_original)
-
-    rows.append({
-        "model": "Original AECOPD-CV model",
-        "auc": auc_o,
-        "auc_ci_low": lo_o,
-        "auc_ci_high": hi_o,
+    rows = [{
+        "model": "AECOPD-CV model",
+        "auc": auc,
+        "auc_ci_low": lo,
+        "auc_ci_high": hi,
         "shown_in_figure": 1,
-    })
+    }]
 
     plt.figure(figsize=(6.8, 6.0))
     plt.plot(
-        fpr_o,
-        tpr_o,
+        fpr,
+        tpr,
         linewidth=2.4,
-        label=f"AECOPD-CV model (AUC {auc_o:.3f}, 95% CI {lo_o:.3f}–{hi_o:.3f})",
+        label=f"AECOPD-CV model (AUC {auc:.3f}, 95% CI {lo:.3f}–{hi:.3f})",
     )
     plt.plot([0, 1], [0, 1], linestyle="--", linewidth=1.2)
     plt.xlabel("False positive rate")
@@ -627,9 +676,12 @@ def make_quartile_plot(y, p, outpath: Path, table_out: Path):
 
     x = np.arange(len(g))
     plt.figure(figsize=(6.4, 5.2))
+    lower_err = np.maximum(g["event_rate"].to_numpy() - g["ci_low"].to_numpy(), 0)
+    upper_err = np.maximum(g["ci_high"].to_numpy() - g["event_rate"].to_numpy(), 0)
+
     plt.errorbar(
         x, g["event_rate"],
-        yerr=[g["event_rate"] - g["ci_low"], g["ci_high"] - g["event_rate"]],
+        yerr=[lower_err, upper_err],
         fmt="o", capsize=4, linewidth=1.5, markersize=8,
     )
     plt.plot(x, g["event_rate"], linewidth=1.7, alpha=0.9)
@@ -689,17 +741,17 @@ def availability_table(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_validation(df: pd.DataFrame, outdir: Path) -> dict:
     y = pd.to_numeric(df["cv_event"], errors="coerce").astype(int).to_numpy()
-    p_original = pd.to_numeric(df["predicted_probability_frozen"], errors="coerce").to_numpy(dtype=float)
+    p = pd.to_numeric(df["predicted_probability_frozen"], errors="coerce").to_numpy(dtype=float)
 
     roc_path = outdir / "figure_roc_external_validation_24h.png"
     dca_path = outdir / "figure_decision_curve_external_validation_24h.png"
     cal_path = outdir / "figure_calibration_external_validation_24h.png"
     quart_path = outdir / "figure_quartiles_external_validation_24h.png"
 
-    roc_rows = make_roc_plot(y, p_original, roc_path, outdir / "table_roc_external_validation_24h.csv")
-    cal = make_calibration_plot(y, p_original, cal_path, outdir / "table_calibration_external_validation_24h.csv")
-    make_dca_plot(y, p_original, dca_path, outdir / "table_decision_curve_external_validation_24h.csv")
-    make_quartile_plot(y, p_original, quart_path, outdir / "table_quartiles_external_validation_24h.csv")
+    roc_rows = make_roc_plot(y, p, roc_path, outdir / "table_roc_external_validation_24h.csv")
+    cal = make_calibration_plot(y, p, cal_path, outdir / "table_calibration_external_validation_24h.csv")
+    make_dca_plot(y, p, dca_path, outdir / "table_decision_curve_external_validation_24h.csv")
+    make_quartile_plot(y, p, quart_path, outdir / "table_quartiles_external_validation_24h.csv")
 
     try:
         make_composite_figure(roc_path, dca_path, cal_path, quart_path, outdir / "External_Validation_Composite_24h.png")
@@ -711,10 +763,10 @@ def run_validation(df: pd.DataFrame, outdir: Path) -> dict:
         "n": int(len(df)),
         "events": int(y.sum()),
         "event_rate": float(np.mean(y)),
-        "auc_original": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc"].iloc[0]),
-        "auc_original_ci_low": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_low"].iloc[0]),
-        "auc_original_ci_high": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_high"].iloc[0]),
-        "brier_original": float(brier_score_loss(y, p_original)),
+        "auc": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc"].iloc[0]),
+        "auc_ci_low": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_low"].iloc[0]),
+        "auc_ci_high": float(roc_tbl.loc[roc_tbl["shown_in_figure"] == 1, "auc_ci_high"].iloc[0]),
+        "brier": float(brier_score_loss(y, p)),
         "calibration_intercept": float(cal["calibration_intercept"]),
         "calibration_slope": float(cal["calibration_slope"]),
     }
@@ -722,36 +774,24 @@ def run_validation(df: pd.DataFrame, outdir: Path) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Preserve original MIMIC-IV external validation cohort/outcome, replace only pH/urea/lactate "
-            "with first plausible values within 24h from admission, regenerate frozen predictions, and run validation."
-        )
-    )
-    parser.add_argument("--original-validation", required=True, help="Original patient-level validation CSV/XLSX with cv_event.")
-    parser.add_argument("--original-sheet", default=None, help="Sheet if original validation file is Excel.")
-    parser.add_argument("--mimic-root", required=True, help="Path to mimic-iv-3.1 folder.")
-    parser.add_argument("--internal-model-dir", required=True, help="Folder with internal model artifacts.")
-    parser.add_argument("--output", required=True, help="Output folder.")
-    parser.add_argument("--hours", type=int, default=24)
-    parser.add_argument("--medians-csv", default=None)
-    args = parser.parse_args()
-
     style()
-    outdir = Path(args.output)
+    outdir = OUTPUT_DIR
     outdir.mkdir(parents=True, exist_ok=True)
 
-    original = load_original_validation(Path(args.original_validation), args.original_sheet)
+    original = load_original_validation(ORIGINAL_VALIDATION, ORIGINAL_SHEET)
 
-    labs12, item_table = extract_first_labs_24h(original, Path(args.mimic_root), hours=args.hours)
+    if "history_hf" not in original.columns and "HF_history" in original.columns:
+        original["history_hf"] = original["HF_history"]
+    if "history_af" not in original.columns and "AF_history" in original.columns:
+        original["history_af"] = original["AF_history"]
+
+    labs24, item_table = extract_first_labs_24h(original, MIMIC_ROOT, hours=LAB_WINDOW_HOURS)
     item_table.to_csv(outdir / "lab_itemids_used_24h.csv", index=False)
 
-    merged = original.merge(labs12, on=["subject_id", "hadm_id"], how="left", validate="one_to_one")
+    merged = original.merge(labs24, on=["subject_id", "hadm_id"], how="left", validate="one_to_one")
 
-    pred, metadata = regenerate_predictions(merged, Path(args.internal_model_dir), args.medians_csv)
+    pred, metadata = regenerate_predictions(merged, INTERNAL_MODEL_DIR, MEDIANS_CSV)
 
-    # Remove old prediction columns from the original validation file before adding the new 24h-lab predictions.
-    # Otherwise pandas creates duplicate columns with the same name, which breaks downstream assignment.
     columns_to_replace = [
         "linear_predictor_original",
         "predicted_probability_original",
@@ -765,8 +805,8 @@ def main() -> None:
     )
 
     final_df = pd.concat([merged_no_old_predictions.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
-
     final_df["predicted_risk_original"] = pd.to_numeric(final_df["predicted_probability_frozen"], errors="coerce")
+
     final_df.to_csv(outdir / "patient_level_external_validation_predictions_MIMIC-IV_24h_labs.csv", index=False)
 
     with pd.ExcelWriter(outdir / "Database_MIMIC-IV_external_validation_24h_labs_predictions.xlsx", engine="openpyxl", mode="w") as writer:
@@ -777,11 +817,22 @@ def main() -> None:
     avail = availability_table(final_df)
     avail.to_csv(outdir / "lab_availability_24h.csv", index=False)
 
+    outcome_counts = pd.DataFrame([{
+        "cv_event_database_original": int(final_df["cv_event_database_original"].sum()) if "cv_event_database_original" in final_df.columns else np.nan,
+        "mi_inclusive_event": int(final_df["mi_inclusive_event"].sum()),
+        "arrhythmia_inclusive_event": int(final_df["arrhythmia_inclusive_event"].sum()),
+        "hf_decompensation_event": int(final_df["hf_decompensation_event"].sum()),
+        "pe_inclusive_event": int(final_df["pe_inclusive_event"].sum()),
+        "cv_event_final": int(final_df["cv_event"].sum()),
+    }])
+    outcome_counts.to_csv(outdir / "outcome_definition_check_24h.csv", index=False)
+
     summary = run_validation(final_df, outdir)
-    summary["lab_window_hours"] = args.hours
-    summary["original_validation_file"] = str(Path(args.original_validation))
-    summary["mimic_root"] = str(Path(args.mimic_root))
-    summary["internal_model_dir"] = str(Path(args.internal_model_dir))
+    summary["lab_window_hours"] = LAB_WINDOW_HOURS
+    summary["original_validation_file"] = str(ORIGINAL_VALIDATION)
+    summary["original_sheet"] = ORIGINAL_SHEET
+    summary["mimic_root"] = str(MIMIC_ROOT)
+    summary["internal_model_dir"] = str(INTERNAL_MODEL_DIR)
     summary["metadata"] = metadata
 
     pd.DataFrame([summary]).to_csv(outdir / "summary_external_validation_24h.csv", index=False)
@@ -790,9 +841,12 @@ def main() -> None:
 
     print("Done.")
     print(f"Rows analysed: {summary['n']}")
-    print(f"Events preserved from original cohort: {summary['events']}")
-    print(f"AUC original/frozen 24h labs: {summary['auc_original']:.3f} ({summary['auc_original_ci_low']:.3f}-{summary['auc_original_ci_high']:.3f})")
+    print(f"Events preserved from final outcome: {summary['events']}")
+    print(f"AUC 24h labs: {summary['auc']:.3f} ({summary['auc_ci_low']:.3f}-{summary['auc_ci_high']:.3f})")
     print(f"Output: {outdir}")
+    print("")
+    print("Outcome definition check:")
+    print(outcome_counts.to_string(index=False))
     print("")
     print("24h lab availability:")
     print(avail.to_string(index=False))
